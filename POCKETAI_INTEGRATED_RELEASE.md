@@ -12,26 +12,17 @@ This fork supplies only the PocketAI-owned OMP Integrated sidecar. It does not r
 
 The release tag format is `pocketai-integrated-v<upstream-version>-<pocketai-revision>`, for example `pocketai-integrated-v17.2.9-1`. The tag must point at the exact reviewed fork commit.
 
-## Required repository secrets
+## Signing boundary
 
-The `PocketAI Integrated release` workflow fails closed if a signing credential is absent.
+The fork release publishes checksummed, attested sidecars for embedding. It does
+not publish standalone applications and does not need Apple or Windows signing
+credentials.
 
-macOS requires:
-
-- `APPLE_CERTIFICATE_P12`: base64-encoded Developer ID Application P12.
-- `APPLE_CERTIFICATE_PASSWORD`: P12 password.
-- `APPLE_API_KEY_ID`: App Store Connect API key ID.
-- `APPLE_API_ISSUER_ID`: App Store Connect issuer UUID.
-- `APPLE_API_KEY`: base64-encoded App Store Connect P8 key.
-
-Windows requires:
-
-- `WINDOWS_SIGNING_PFX_BASE64`: base64-encoded Authenticode PFX.
-- `WINDOWS_SIGNING_PFX_PASSWORD`: PFX password.
-
-The optional repository variable `WINDOWS_SIGNING_TIMESTAMP_URL` overrides the default DigiCert RFC 3161 timestamp service.
-
-Use GitHub environments or organization secret policy to restrict these values to repository administrators. Do not place signing material in the source tree, workflow artifacts, logs, or PocketAI's lock file.
+PocketAI Desktop downloads the exact locked sidecar before packaging. Its
+existing macOS release pipeline signs every Mach-O in the application bundle
+and notarizes the final app; its Windows release pipeline signs every staged
+EXE/DLL before building and auditing the installer. The final PocketAI package,
+not this intermediate fork release, is the platform-signing boundary.
 
 ## Release procedure
 
@@ -39,7 +30,7 @@ Use GitHub environments or organization secret policy to restrict these values t
 2. Run `bun install --frozen-lockfile`, `bun check`, the PocketAI policy tests, and a real local sidecar probe.
 3. Push the reviewed commit to `trev222/oh-my-pi`.
 4. Create and push an annotated `pocketai-integrated-v<version>-<revision>` tag on that exact commit.
-5. Wait for the `PocketAI Integrated release` workflow. It must build all five binaries, sign macOS and Windows, run full TypeScript/Rust validation, run the Integrated policy smoke on every native platform, generate `SHA256SUMS`, create GitHub build-provenance attestations, verify the exact candidate bytes on their native runners, and only then publish the release.
+5. Wait for the `PocketAI Integrated release` workflow. It must build all five binaries, run full TypeScript/Rust validation, run the Integrated policy smoke on every native platform, generate `SHA256SUMS`, create GitHub build-provenance attestations, verify the exact candidate bytes on their native runners, and only then publish the release.
 6. Verify the published release independently:
 
    ```sh
@@ -72,9 +63,11 @@ Use GitHub environments or organization secret policy to restrict these values t
    The generator fixes the fork URL, upstream URL, release tag/URL, exact five
    targets, and provenance policy rather than accepting those as operator
    inputs. Run `npm run check:omp-integrated-lock --prefix apps/desktop`, parent
-   packaging tests, and all platform gates before releasing PocketAI.
+   packaging tests, and all platform gates before releasing PocketAI. The
+   macOS and Windows gates must verify that the staged `omp-integrated` sidecar
+   was signed as part of the final application package.
 
-The workflow publishes these assets and no unsigned alternative:
+The workflow publishes exactly these embeddable inputs:
 
 - `omp-darwin-arm64`
 - `omp-darwin-x64`
@@ -93,8 +86,8 @@ Do not delete the prior GitHub release while a shipped PocketAI version referenc
 
 ## Failure handling
 
-- Missing or invalid signing credentials: rotate or repair the repository secret; never publish unsigned replacements.
 - Native policy smoke failure: fix or revert the fork patch. Do not weaken the policy assertions.
 - Digest or provenance mismatch: discard the candidate tag and issue a new PocketAI revision after investigating the build inputs.
 - Parent staging rejection: verify `forkRepository`, `releaseBaseUrl`, commit, target names, and SHA-256 values in `omp-integrated.lock.json`.
+- Final PocketAI signature failure: fix the existing PocketAI Desktop release setup or packaging pipeline; do not add platform-signing credentials to this fork.
 - OMP CLI failures are unrelated to this sidecar: diagnose the user's executable and native OMP configuration without reading, rewriting, or replacing it with Integrated.
