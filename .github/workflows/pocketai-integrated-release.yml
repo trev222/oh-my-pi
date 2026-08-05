@@ -65,10 +65,14 @@ jobs:
             echo "PocketAI Integrated releases must be built from $POCKETAI_OMP_RELEASE_REPOSITORY" >&2
             exit 1
           fi
-          case "$GITHUB_REF_NAME" in
-            pocketai-integrated-v[0-9]*-[0-9]*) ;;
-            *) echo "Invalid release tag: $GITHUB_REF_NAME" >&2; exit 1 ;;
-          esac
+          if [[ ! "$GITHUB_REF_NAME" =~ ^pocketai-integrated-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+            echo "Invalid release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" != tag ]; then
+            echo "PocketAI Integrated releases require an annotated tag" >&2
+            exit 1
+          fi
           test "$(git rev-list -n1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
 
   native_addons:
