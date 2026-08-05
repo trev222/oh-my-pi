@@ -60,6 +60,40 @@ import type {
 // Re-export types for consumers
 export type * from "./rpc-types";
 
+const POCKETAI_INTEGRATED_RPC_COMMANDS: ReadonlySet<string> = new Set([
+	"negotiate_protocol",
+	"prompt",
+	"steer",
+	"follow_up",
+	"abort",
+	"abort_and_prompt",
+	"get_state",
+	"get_available_commands",
+	"set_model",
+	"cycle_model",
+	"get_available_models",
+	"set_thinking_level",
+	"cycle_thinking_level",
+	"set_steering_mode",
+	"set_follow_up_mode",
+	"set_interrupt_mode",
+	"compact",
+	"set_auto_compaction",
+	"set_auto_retry",
+	"abort_retry",
+	"get_session_stats",
+	"get_branch_messages",
+	"get_last_assistant_text",
+	"set_session_name",
+	"get_messages",
+	"get_messages_page",
+]);
+
+/** PocketAI's bundled runtime exposes only model/session RPC, never host capabilities. */
+export function isPocketAiIntegratedRpcCommandAllowed(commandType: string): boolean {
+	return POCKETAI_INTEGRATED_RPC_COMMANDS.has(commandType);
+}
+
 export type PendingExtensionRequest = {
 	resolve: (response: RpcExtensionUIResponse) => void;
 	reject: (error: Error) => void;
@@ -665,6 +699,7 @@ export async function runRpcMode(
 	eventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
 ): Promise<never> {
+	const pocketAiIntegrated = $env.POCKETAI_OMP_INTEGRATED === "1";
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
@@ -953,7 +988,7 @@ export async function runRpcMode(
 		output(event);
 	});
 
-	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
+	const getAvailableCommands = async () => (pocketAiIntegrated ? [] : buildAvailableSlashCommands(session));
 	const reloadPluginState = async () => {
 		const cwd = session.sessionManager.getCwd();
 		const projectPath = await resolveActiveProjectRegistryPath(cwd);
@@ -974,6 +1009,14 @@ export async function runRpcMode(
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		if (pocketAiIntegrated && !isPocketAiIntegratedRpcCommandAllowed(command.type)) {
+			return error(
+				id,
+				command.type,
+				`RPC command '${command.type}' is disabled by the PocketAI Integrated policy`,
+				"pocketai_integrated_restricted",
+			);
+		}
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -987,37 +1030,39 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
-				const skillResult = await tryRunRpcSkillCommand(session, command.message, command.streamingBehavior);
-				if (skillResult) {
-					return success(id, "prompt", skillResult);
-				}
-				const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
-					session,
-					sessionManager: session.sessionManager,
-					settings: session.settings,
-					cwd: session.sessionManager.getCwd(),
-					output: text => output({ type: "command_output", text }),
-					refreshCommands: emitAvailableCommandsUpdate,
-					reloadPlugins: reloadPluginState,
-					notifyTitleChanged: async () => {
-						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
-					},
-					notifyConfigChanged: async () => {
-						output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
-					},
-				});
-				if (builtinResult !== false) {
-					if ("prompt" in builtinResult) {
-						watchAndReportLocalOnlyPromptResult({
-							id,
-							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
-							output,
-							onError: promptError => output(error(id, "prompt", promptError.message)),
-							extensionUserMessageTracker,
-						});
-						return success(id, "prompt");
+				if (!pocketAiIntegrated) {
+					const skillResult = await tryRunRpcSkillCommand(session, command.message, command.streamingBehavior);
+					if (skillResult) {
+						return success(id, "prompt", skillResult);
 					}
-					return success(id, "prompt", { agentInvoked: false });
+					const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
+						session,
+						sessionManager: session.sessionManager,
+						settings: session.settings,
+						cwd: session.sessionManager.getCwd(),
+						output: text => output({ type: "command_output", text }),
+						refreshCommands: emitAvailableCommandsUpdate,
+						reloadPlugins: reloadPluginState,
+						notifyTitleChanged: async () => {
+							output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
+						},
+						notifyConfigChanged: async () => {
+							output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
+						},
+					});
+					if (builtinResult !== false) {
+						if ("prompt" in builtinResult) {
+							watchAndReportLocalOnlyPromptResult({
+								id,
+								startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
+								output,
+								onError: promptError => output(error(id, "prompt", promptError.message)),
+								extensionUserMessageTracker,
+							});
+							return success(id, "prompt");
+						}
+						return success(id, "prompt", { agentInvoked: false });
+					}
 				}
 
 				// Don't await - events will stream

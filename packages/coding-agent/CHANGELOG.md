@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Added the `POCKETAI_OMP_INTEGRATED=1` launch policy, which keeps PocketAI-selected models and workspaces available while forcing OMP-native tools, MCP, project instructions, ambient extensions, skills, rules, extra directories, LSP, plugin updates, slash commands, host-capability RPC commands, and home-directory access off for PocketAI-hosted sessions. Absolute isolated `PI_CONFIG_DIR` roots are also honored, and inherited provider credentials plus HOME/project dotenv files are excluded from Integrated sessions.
+
 ## [17.2.9] - 2026-08-05
 
 ### Breaking Changes

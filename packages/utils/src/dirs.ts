@@ -104,7 +104,12 @@ function readProfileFromEnvSafe(): string | undefined {
 }
 
 function getBaseConfigRoot(): string {
-	return path.join(os.homedir(), getConfigDirName());
+	return resolveConfigRoot(os.homedir(), getConfigDirName());
+}
+
+/** Resolve PI_CONFIG_DIR while preserving absolute isolated roots. */
+export function resolveConfigRoot(homeDir: string, configDir: string): string {
+	return path.isAbsolute(configDir) ? path.normalize(configDir) : path.join(homeDir, configDir);
 }
 
 function getProfileConfigRoot(profile: string | undefined): string {

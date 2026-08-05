@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getConfigRootDir, refreshDirsFromEnv } from "./dirs";
+import { isPocketAiIntegratedLaunchEnvName } from "./pocketai-integrated-env";
 
 export * from "./worker-host";
 
@@ -193,15 +194,24 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
+const pocketAiIntegrated = Bun.env.POCKETAI_OMP_INTEGRATED === "1";
+
+// Integrated accepts only PocketAI's isolated config/agent dotenv files. A
+// normal OMP launch deliberately retains its native HOME/project behavior.
+const homeEnv = pocketAiIntegrated ? {} : parseEnvFile(path.join(os.homedir(), ".env"));
 const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
+const projectEnv = pocketAiIntegrated ? {} : parseEnvFile(path.join(process.cwd(), ".env"));
 
 for (const key of Object.keys(Bun.env)) {
 	const value = Bun.env[key];
-	if (!isSafeEnvName(key) || isMacosMallocStackLoggingEnvName(key) || value === undefined || !isSafeEnvValue(value)) {
+	if (
+		!isSafeEnvName(key) ||
+		isMacosMallocStackLoggingEnvName(key) ||
+		value === undefined ||
+		!isSafeEnvValue(value) ||
+		(pocketAiIntegrated && !isPocketAiIntegratedLaunchEnvName(key))
+	) {
 		delete Bun.env[key];
 	}
 }

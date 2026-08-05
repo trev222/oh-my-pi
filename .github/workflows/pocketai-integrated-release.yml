@@ -1,0 +1,499 @@
+name: PocketAI Integrated release
+
+on:
+  push:
+    branches: [main, pocketai]
+    tags: ["pocketai-integrated-v*"]
+  pull_request:
+    paths:
+      - "packages/coding-agent/**"
+      - "packages/utils/**"
+      - "scripts/ci-pocketai-*"
+      - "scripts/ci-windows-sign.ps1"
+      - ".github/workflows/pocketai-integrated-release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/pocketai-integrated-v') }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  POCKETAI_OMP_RELEASE_REPOSITORY: trev222/oh-my-pi
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    name: Validate PocketAI fork policy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+      - name: Lint and type-check the fork
+        run: bun check
+      - name: Verify Integrated policy contracts
+        run: |
+          bun test \
+            packages/coding-agent/test/pocketai-integrated-cli-policy.test.ts \
+            packages/coding-agent/test/pocketai-integrated-rpc-policy.test.ts \
+            packages/utils/test/pocketai-config-root.test.ts \
+            packages/utils/test/pocketai-integrated-env.test.ts
+
+  release_ref:
+    name: Validate release ref
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - name: Require a PocketAI fork tag on the checked-out commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.repository }}" != "$POCKETAI_OMP_RELEASE_REPOSITORY" ]; then
+            echo "PocketAI Integrated releases must be built from $POCKETAI_OMP_RELEASE_REPOSITORY" >&2
+            exit 1
+          fi
+          case "$GITHUB_REF_NAME" in
+            pocketai-integrated-v[0-9]*-[0-9]*) ;;
+            *) echo "Invalid release tag: $GITHUB_REF_NAME" >&2; exit 1 ;;
+          esac
+          test "$(git rev-list -n1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+
+  native_addons:
+    name: Build non-Darwin native addons
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [release_ref]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - id: cache
+        uses: ./.github/actions/bazel-cache
+        with:
+          scope: pocketai-integrated-linux
+      - name: Build required native addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          for target in \
+            natives-linux-arm64 \
+            natives-linux-x64-baseline \
+            natives-linux-x64-modern \
+            natives-win32-x64-baseline; do
+            bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build "//:$target"
+          done
+      - name: Upload native addons
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pocketai-native-addons
+          path: bazel-bin/natives-*/*.node
+          if-no-files-found: error
+          retention-days: 3
+
+  validate_full:
+    name: Full fork release validation
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [policy, native_addons]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: ./.github/actions/setup-system-deps
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+      - name: Download native addons
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pocketai-native-addons
+          path: ${{ runner.temp }}/pocketai-native-addons
+      - name: Install native addons
+        shell: bash
+        run: |
+          bun scripts/bazel-natives.ts linux-x64-baseline linux-x64-modern \
+            --source "$RUNNER_TEMP/pocketai-native-addons" \
+            --dest packages/natives/native
+      - name: Run complete TypeScript and Rust validation
+        env:
+          OMP_TEST_CONCURRENCY: "4"
+          OMP_TEST_CHUNK_TIMEOUT: "1200"
+        run: bun run ci:test:full
+
+  build_hosted:
+    name: "Build ${{ matrix.target_id }}"
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [release_ref, native_addons]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target_id: linux-x64
+            binary_path: packages/coding-agent/binaries/omp-linux-x64
+            native_targets: linux-x64-baseline linux-x64-modern
+            artifact_name: pocketai-omp-linux-x64
+            smoke: true
+          - os: ubuntu-24.04-arm
+            target_id: linux-arm64
+            binary_path: packages/coding-agent/binaries/omp-linux-arm64
+            native_targets: linux-arm64
+            artifact_name: pocketai-omp-linux-arm64
+            smoke: true
+          - os: ubuntu-22.04
+            target_id: win32-x64
+            binary_path: packages/coding-agent/binaries/omp-windows-x64.exe
+            native_targets: win32-x64-baseline
+            artifact_name: pocketai-omp-win32-x64-unsigned
+            smoke: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+      - name: Download native addons
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pocketai-native-addons
+          path: ${{ runner.temp }}/pocketai-native-addons
+      - name: Install target native addons
+        shell: bash
+        env:
+          NATIVE_TARGETS: ${{ matrix.native_targets }}
+        run: |
+          read -r -a targets <<< "$NATIVE_TARGETS"
+          bun scripts/bazel-natives.ts "${targets[@]}" \
+            --source "$RUNNER_TEMP/pocketai-native-addons" \
+            --dest packages/natives/native
+      - name: Build release binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target_id }}
+        run: bun run ci:release:build-binaries
+      - name: Smoke release binary and Integrated policy
+        if: matrix.smoke
+        shell: bash
+        run: |
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --version
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --smoke-test
+          bun scripts/ci-pocketai-integrated-smoke.ts "${{ matrix.binary_path }}"
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+          retention-days: 3
+
+  build_darwin:
+    name: "Build, sign, and notarize ${{ matrix.target_id }}"
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [release_ref]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target_id: darwin-x64
+            binary_path: packages/coding-agent/binaries/omp-darwin-x64
+            native_targets: darwin-x64-baseline
+          - os: macos-14
+            target_id: darwin-arm64
+            binary_path: packages/coding-agent/binaries/omp-darwin-arm64
+            native_targets: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - run: bun install --frozen-lockfile
+      - name: Build native addon
+        uses: ./.github/actions/bazel-natives
+        with:
+          targets: ${{ matrix.native_targets }}
+          cache-scope: pocketai-integrated-${{ matrix.target_id }}
+      - name: Build release binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target_id }}
+        run: bun run ci:release:build-binaries
+      - name: Require macOS signing and notarization credentials
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY; do
+            test -n "${!name:-}" || { echo "$name is required" >&2; exit 1; }
+          done
+      - name: Sign and notarize with Developer ID
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: bash scripts/ci-macos-sign.sh "${{ matrix.binary_path }}"
+      - name: Verify signed runtime and Integrated policy
+        shell: bash
+        run: |
+          codesign --verify --strict --verbose=4 "${{ matrix.binary_path }}"
+          if codesign -dvvv "${{ matrix.binary_path }}" 2>&1 | grep -qE "flags=.*adhoc|Signature=adhoc"; then
+            echo "Developer ID signing did not replace the ad-hoc signature" >&2
+            exit 1
+          fi
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --smoke-test
+          bun scripts/ci-pocketai-integrated-smoke.ts "${{ matrix.binary_path }}"
+      - name: Upload signed binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pocketai-omp-${{ matrix.target_id }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+          retention-days: 3
+
+  sign_windows:
+    name: Sign and verify win32-x64
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [build_hosted]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Download unsigned Windows binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pocketai-omp-win32-x64-unsigned
+          path: dist
+      - name: Authenticode sign and verify
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGNING_TIMESTAMP_URL }}
+        shell: pwsh
+        run: ./scripts/ci-windows-sign.ps1 -Binary ./dist/omp-windows-x64.exe
+      - name: Smoke signed runtime and Integrated policy
+        shell: pwsh
+        run: |
+          & ./dist/omp-windows-x64.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "Windows version smoke failed" }
+          & ./dist/omp-windows-x64.exe --smoke-test
+          if ($LASTEXITCODE -ne 0) { throw "Windows runtime smoke failed" }
+          bun scripts/ci-pocketai-integrated-smoke.ts ./dist/omp-windows-x64.exe
+      - name: Upload signed Windows binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pocketai-omp-win32-x64
+          path: dist/omp-windows-x64.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  assemble:
+    name: Assemble and attest release
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [validate_full, build_hosted, build_darwin, sign_windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download darwin-arm64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-darwin-arm64, path: dist }
+      - name: Download darwin-x64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-darwin-x64, path: dist }
+      - name: Download linux-arm64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-linux-arm64, path: dist }
+      - name: Download linux-x64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-linux-x64, path: dist }
+      - name: Download win32-x64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-win32-x64, path: dist }
+      - name: Generate checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          test -f omp-darwin-arm64
+          test -f omp-darwin-x64
+          test -f omp-linux-arm64
+          test -f omp-linux-x64
+          test -f omp-windows-x64.exe
+          sha256sum omp-darwin-arm64 omp-darwin-x64 omp-linux-arm64 omp-linux-x64 omp-windows-x64.exe > SHA256SUMS
+      - name: Attest every release binary
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Upload assembled release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pocketai-omp-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  verify_linux:
+    name: "Verify release candidate ${{ matrix.target_id }}"
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [assemble]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target_id: linux-x64
+            asset: omp-linux-x64
+          - os: ubuntu-24.04-arm
+            target_id: linux-arm64
+            asset: omp-linux-arm64
+    runs-on: ${{ matrix.os }}
+    permissions: { contents: read, attestations: read }
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with: { bun-version: "1.3.14" }
+      - name: Download assembled release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-release, path: verify }
+      - name: Verify checksum, provenance, runtime, and policy
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          cd verify
+          grep "  ${{ matrix.asset }}$" SHA256SUMS | sha256sum -c -
+          gh attestation verify "${{ matrix.asset }}" --repo "${{ github.repository }}"
+          chmod +x "${{ matrix.asset }}"
+          "./${{ matrix.asset }}" --smoke-test
+          cd ..
+          bun scripts/ci-pocketai-integrated-smoke.ts "verify/${{ matrix.asset }}"
+
+  verify_darwin:
+    name: "Verify release candidate ${{ matrix.target_id }}"
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [assemble]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target_id: darwin-x64
+            asset: omp-darwin-x64
+          - os: macos-14
+            target_id: darwin-arm64
+            asset: omp-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    permissions: { contents: read, attestations: read }
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with: { bun-version: "1.3.14" }
+      - name: Download assembled release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-release, path: verify }
+      - name: Verify checksum, signature, provenance, runtime, and policy
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          cd verify
+          grep "  ${{ matrix.asset }}$" SHA256SUMS | shasum -a 256 -c -
+          gh attestation verify "${{ matrix.asset }}" --repo "${{ github.repository }}"
+          chmod +x "${{ matrix.asset }}"
+          codesign --verify --strict --verbose=4 "${{ matrix.asset }}"
+          if codesign -dvvv "${{ matrix.asset }}" 2>&1 | grep -qE "flags=.*adhoc|Signature=adhoc"; then exit 1; fi
+          "./${{ matrix.asset }}" --smoke-test
+          cd ..
+          bun scripts/ci-pocketai-integrated-smoke.ts "verify/${{ matrix.asset }}"
+
+  verify_windows:
+    name: Verify release candidate win32-x64
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [assemble]
+    runs-on: windows-2022
+    permissions: { contents: read, attestations: read }
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with: { bun-version: "1.3.14" }
+      - name: Download assembled release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-release, path: verify }
+      - name: Verify signature, provenance, runtime, and policy
+        env: { GH_TOKEN: "${{ github.token }}" }
+        shell: pwsh
+        run: |
+          $manifestLine = Get-Content verify/SHA256SUMS | Where-Object { $_ -match "  omp-windows-x64\.exe$" } | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($manifestLine)) { throw "Windows checksum is absent from SHA256SUMS" }
+          $expected = $manifestLine.Split([char[]]" `t", [System.StringSplitOptions]::RemoveEmptyEntries)[0].ToLowerInvariant()
+          $actual = (Get-FileHash verify/omp-windows-x64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "Windows checksum mismatch" }
+          gh attestation verify verify/omp-windows-x64.exe --repo "${{ github.repository }}"
+          $signature = Get-AuthenticodeSignature verify/omp-windows-x64.exe
+          if ($signature.Status -ne "Valid") { throw "Invalid Authenticode signature: $($signature.Status)" }
+          & ./verify/omp-windows-x64.exe --smoke-test
+          if ($LASTEXITCODE -ne 0) { throw "Windows runtime smoke failed" }
+          bun scripts/ci-pocketai-integrated-smoke.ts ./verify/omp-windows-x64.exe
+
+  publish_release:
+    name: Publish verified release
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [verify_linux, verify_darwin, verify_windows]
+    runs-on: ubuntu-22.04
+    permissions: { contents: write }
+    steps:
+      - name: Download verified release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: pocketai-omp-release, path: dist }
+      - name: Publish release only after every native verification gate
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: dist/*
+          body: |
+            PocketAI Integrated OMP sidecars built from `${{ github.sha }}`.
+
+            Every asset passed its native signature, provenance, runtime, and Integrated-policy verification before publication.
+
+  verify_published_release:
+    name: Verify published release bytes
+    if: startsWith(github.ref, 'refs/tags/pocketai-integrated-v')
+    needs: [publish_release]
+    runs-on: ubuntu-22.04
+    permissions: { contents: read, attestations: read }
+    steps:
+      - name: Download every published asset
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir published
+      - name: Verify published checksums and provenance
+        env: { GH_TOKEN: "${{ github.token }}" }
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd published
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 6
+          sha256sum -c SHA256SUMS
+          for asset in omp-darwin-arm64 omp-darwin-x64 omp-linux-arm64 omp-linux-x64 omp-windows-x64.exe; do
+            gh attestation verify "$asset" --repo "${{ github.repository }}"
+          done

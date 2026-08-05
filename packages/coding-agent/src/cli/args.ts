@@ -22,6 +22,8 @@ export { getExtraHelpText };
 export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
+	/** Internal launch marker for the PocketAI-owned bundled runtime. Not a CLI flag. */
+	pocketAiIntegrated?: boolean;
 	cwd?: string;
 	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
 	addDir?: string[];
@@ -96,6 +98,10 @@ export interface Args {
 	unrecognizedFlags: string[];
 }
 
+export interface ParseArgsOptions {
+	pocketAiIntegrated?: boolean;
+}
+
 /**
  * Runtime dependencies the data-driven setters need. Constructed once at
  * module load and passed to every {@link STRING_SETTERS} call so the
@@ -139,7 +145,11 @@ function consumeBuiltInStringValue(flag: string, args: string[], valueIndex: num
 	return { value, index: valueIndex };
 }
 
-export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
+export function parseArgs(
+	inputArgs: string[],
+	extensionFlags?: Map<string, { type: "boolean" | "string" }>,
+	options: ParseArgsOptions = {},
+): Args {
 	// Work on a copy: the `--option=value` handling below splices the value
 	// into the array, and callers reuse the same argv (the post-extension
 	// reparse in `runRootCommand` parses it a second time). Mutating the input
@@ -302,6 +312,28 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		if (equalsValueIndex !== -1 && i === flagIndex) {
 			args.splice(equalsValueIndex, 1);
 		}
+	}
+
+	const pocketAiIntegrated = options.pocketAiIntegrated ?? $env.POCKETAI_OMP_INTEGRATED === "1";
+	if (pocketAiIntegrated) {
+		result.pocketAiIntegrated = true;
+		result.noTools = true;
+		result.tools = undefined;
+		result.noExtensions = true;
+		result.extensions = undefined;
+		result.hooks = undefined;
+		result.pluginDirs = undefined;
+		result.noSkills = true;
+		result.skills = undefined;
+		result.noRules = true;
+		result.addDir = undefined;
+		result.allowHome = false;
+		result.config = undefined;
+		result.systemPrompt = undefined;
+		result.appendSystemPrompt = undefined;
+		result.apiKey = undefined;
+		result.autoApprove = false;
+		result.approvalMode = "always-ask";
 	}
 
 	return result;

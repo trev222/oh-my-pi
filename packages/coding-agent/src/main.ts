@@ -12,6 +12,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
 	directoryExists,
+	getAgentDir,
 	getLogPath,
 	getProjectDir,
 	logger,
@@ -876,10 +877,13 @@ export async function buildSessionOptions(
 		options.deadline = Date.now() + parsed.maxTime * 1000;
 	}
 
-	// Auto-discover SYSTEM.md if no CLI system prompt provided
-	const systemPromptSource = parsed.systemPrompt ?? discoverSystemPromptFile();
-	const appendPromptSource = parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile();
-	const titleSystemPromptSource = discoverTitleSystemPromptFile();
+	// The PocketAI-owned bundled runtime receives its prompt through PocketAI's
+	// bridge. Never merge ambient project/global prompt files into that contract.
+	const allowAmbientPromptFiles = parsed.pocketAiIntegrated !== true;
+	const systemPromptSource = parsed.systemPrompt ?? (allowAmbientPromptFiles ? discoverSystemPromptFile() : undefined);
+	const appendPromptSource =
+		parsed.appendSystemPrompt ?? (allowAmbientPromptFiles ? discoverAppendSystemPromptFile() : undefined);
+	const titleSystemPromptSource = allowAmbientPromptFiles ? discoverTitleSystemPromptFile() : undefined;
 	const [resolvedSystemPrompt, resolvedAppendPrompt, titleSystemPrompt] = await Promise.all([
 		resolvePromptInput(systemPromptSource, "system prompt"),
 		resolvePromptInput(appendPromptSource, "append system prompt"),
@@ -1124,7 +1128,61 @@ export async function buildSessionOptions(
 		options.disableExtensionDiscovery = true;
 	}
 
-	return options;
+	return applyPocketAiIntegratedSessionPolicy(parsed, options);
+}
+
+/**
+ * Convert the bundled PocketAI launch into a genuinely restricted SDK session.
+ * `--no-tools` alone only filters built-ins; MCP, custom tools, extensions, and
+ * AGENTS.md discovery otherwise remain active. The integrated runtime is a
+ * model/session engine behind PocketAI's own tool and approval loop, so every
+ * ambient OMP capability and project instruction source is removed here.
+ */
+export function applyPocketAiIntegratedSessionPolicy(
+	parsed: Pick<Args, "pocketAiIntegrated">,
+	options: CreateAgentSessionOptions,
+): CreateAgentSessionOptions {
+	if (parsed.pocketAiIntegrated !== true) return options;
+
+	const restricted = { ...options };
+	delete restricted.additionalDirectories;
+	delete restricted.systemPrompt;
+	delete restricted.customSystemPrompt;
+	delete restricted.appendSystemPrompt;
+	delete restricted.titleSystemPrompt;
+	delete restricted.additionalExtensionPaths;
+	delete restricted.preloadedExtensions;
+	delete restricted.preloadedExtensionPaths;
+	delete restricted.preloadedCustomToolPaths;
+	delete restricted.prewalk;
+	delete restricted.planYolo;
+
+	restricted.autoApprove = false;
+	restricted.toolNames = [];
+	restricted.restrictToolNames = true;
+	restricted.allowRestrictedCustomTools = false;
+	restricted.customTools = [];
+	restricted.extensions = [];
+	restricted.disableExtensionDiscovery = true;
+	restricted.skills = [];
+	restricted.rules = [];
+	restricted.contextFiles = [];
+	restricted.workspaceTree = {
+		rootPath: restricted.cwd ?? getProjectDir(),
+		rendered: "",
+		truncated: false,
+		totalLines: 0,
+		agentsMdFiles: [],
+	};
+	restricted.promptTemplates = [];
+	restricted.slashCommands = [];
+	restricted.enableMCP = false;
+	restricted.enableLsp = false;
+	restricted.enableIrc = false;
+	restricted.skipPythonPreflight = true;
+	restricted.spawns = "";
+
+	return restricted;
 }
 
 interface RunRootCommandDependencies {
@@ -1186,8 +1244,9 @@ export async function runRootCommand(
 	// Kick off plugin-root preload in parallel with the remaining startup work.
 	// Awaited later (before extension/skill discovery in createAgentSession needs it).
 	const home = os.homedir();
-	const pluginPreloadPromise =
-		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+	const pluginPreloadPromise = parsedArgs.pocketAiIntegrated
+		? Promise.resolve()
+		: parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
 			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
 			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
 	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
@@ -1200,10 +1259,12 @@ export async function runRootCommand(
 	// Explicit roots remain authorized under `--no-extensions`; only ambient
 	// extension discovery is disabled.
 	const cliExtensions = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
-	injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir(), {
-		mode: parsedArgs.noExtensions ? "explicit-only" : "merge",
-		replace: true,
-	});
+	if (!parsedArgs.pocketAiIntegrated) {
+		injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir(), {
+			mode: parsedArgs.noExtensions ? "explicit-only" : "merge",
+			replace: true,
+		});
+	}
 
 	let cwd = getProjectDir();
 	// Classify the host before opening auth or settings storage so every
@@ -1222,8 +1283,14 @@ export async function runRootCommand(
 	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
 	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
 
+	const settingsCwd = parsedArgs.pocketAiIntegrated ? getAgentDir() : cwd;
 	const settingsInstance =
-		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
+		deps.settings ??
+		(await logger.time("settings:init", Settings.init, { cwd: settingsCwd, configFiles: parsedArgs.config }));
+	if (parsedArgs.pocketAiIntegrated) {
+		settingsInstance.override("startup.checkUpdate", false);
+		settingsInstance.override("marketplace.autoUpdate", "off");
+	}
 	if (parsedArgs.approvalMode) {
 		// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
 		// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
@@ -1463,15 +1530,17 @@ export async function runRootCommand(
 	}
 
 	await pluginPreloadPromise;
-	if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+	if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES && !parsedArgs.pocketAiIntegrated) {
 		await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
 	}
 
-	scheduleMarketplaceAutoUpdate({
-		autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
-		resolveActiveProjectRegistryPath,
-		clearPluginRootsCache: clearPluginRootsAndCaches,
-	});
+	if (!parsedArgs.pocketAiIntegrated) {
+		scheduleMarketplaceAutoUpdate({
+			autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
+			resolveActiveProjectRegistryPath,
+			clearPluginRootsCache: clearPluginRootsAndCaches,
+		});
+	}
 
 	const sessionOptions = await logger.time(
 		"buildSessionOptions",
