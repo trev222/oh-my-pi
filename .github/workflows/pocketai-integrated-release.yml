@@ -36,6 +36,11 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Lint and type-check the fork
         run: bun check
+      - name: Build the exact-source host addon for policy tests
+        uses: ./.github/actions/bazel-natives
+        with:
+          targets: host
+          cache-scope: pocketai-integrated-policy
       - name: Verify Integrated policy contracts
         run: |
           bun test \
