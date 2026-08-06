@@ -134,7 +134,9 @@ jobs:
             --dest packages/natives/native
       - name: Run complete TypeScript validation
         env:
-          OMP_TEST_CONCURRENCY: "4"
+          # Upstream browser/TUI tests use sub-second timing assertions and
+          # become nondeterministic when several heavy chunks compete for CPU.
+          OMP_TEST_CONCURRENCY: "1"
           OMP_TEST_CHUNK_TIMEOUT: "1200"
         shell: bash
         run: |
