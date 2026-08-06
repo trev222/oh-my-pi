@@ -36,7 +36,10 @@ async function runPolicyProbe(binary: string): Promise<void> {
 	const stateDir = path.join(root, "state");
 	const cacheDir = path.join(root, "cache");
 	const workspace = path.join(root, "workspace");
-	const sessionRoot = path.join(dataDir, "omp", "sessions");
+	// OMP uses XDG data directories on macOS/Linux, while Windows intentionally
+	// keeps session data under PI_CODING_AGENT_DIR.
+	const sessionRoot =
+		process.platform === "win32" ? path.join(agentDir, "sessions") : path.join(dataDir, "omp", "sessions");
 
 	await Promise.all([
 		fs.mkdir(agentDir, { recursive: true }),
