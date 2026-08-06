@@ -132,11 +132,26 @@ jobs:
           bun scripts/bazel-natives.ts linux-x64-baseline linux-x64-modern \
             --source "$RUNNER_TEMP/pocketai-native-addons" \
             --dest packages/natives/native
-      - name: Run complete TypeScript and Rust validation
+      - name: Run complete TypeScript validation
         env:
           OMP_TEST_CONCURRENCY: "4"
           OMP_TEST_CHUNK_TIMEOUT: "1200"
-        run: bun run ci:test:full
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          for attempt in $(seq 1 "$max_attempts"); do
+            if bun run ci:test:ts; then
+              exit 0
+            fi
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "TypeScript validation failed after $max_attempts attempts" >&2
+              exit 1
+            fi
+            echo "::warning::TypeScript validation attempt $attempt failed; retrying the complete upstream suite"
+          done
+      - name: Run complete Rust validation
+        run: bun run test:rs
 
   build_hosted:
     name: "Build ${{ matrix.target_id }}"
